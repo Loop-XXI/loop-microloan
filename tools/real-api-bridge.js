@@ -302,28 +302,62 @@ async function route(req, res) {
     const fundingTxid = String(body.funding_txid || '').trim();
     const vout = Number(body.vout);
     const amountSats = Number(body.amount_sats || 0);
-    const verificationMode = body.verification_mode || 'dev_auto';
     if (!validTxid(fundingTxid)) return json(res, 400, { success: false, error: 'funding_txid must be 64 hex characters' });
     if (!Number.isInteger(vout) || vout < 0) return json(res, 400, { success: false, error: 'vout must be a non-negative integer' });
     const result = await db(async c => {
       await c.query('BEGIN');
-      const offerRes = await c.query(`SELECT * FROM noncustodial_collateral_offers WHERE id=$1 FOR UPDATE`, [id]);
-      if (!offerRes.rowCount) throw new Error('offer not found');
-      const offer = offerRes.rows[0];
-      if (!['OFFERED','LOCK_PROOF_SUBMITTED','LOCK_VERIFIED'].includes(offer.status)) throw new Error(`offer status ${offer.status} cannot accept proof`);
-      if (amountSats < Number(offer.collateral_sats)) throw new Error(`proof amount ${amountSats} below required collateral ${offer.collateral_sats}`);
-      const proof = { funding_txid: fundingTxid, vout, amount_sats: amountSats, proof_type: body.proof_type || 'txid_vout', verification_mode: verificationMode, submitted_at: new Date().toISOString(), notes: body.notes || null };
-      const verified = verificationMode === 'dev_auto' || offer.bitcoin_network === 'bitcoin_regtest' || offer.bitcoin_network === 'bitcoin_testnet' || offer.bitcoin_network === 'mutinynet';
-      await c.query(`
-        UPDATE noncustodial_collateral_offers
-        SET status=$2, lock_txid=$3, lock_vout=$4, lock_amount_sats=$5, lock_proof=$6,
-            lock_verified_at=CASE WHEN $7 THEN NOW() ELSE lock_verified_at END,
-            verification_notes=$8, updated_at=NOW()
-        WHERE id=$1
-      `, [id, verified ? 'LOCK_VERIFIED' : 'LOCK_PROOF_SUBMITTED', fundingTxid, vout, amountSats, proof, verified, verified ? 'Verified by v0 dev/test verifier. Production requires SPV/DLC verification.' : 'Proof submitted; awaiting production verifier/admin review.']);
-      let loan = null;
-      let usdc = null;
-      if (verified && !offer.loan_id) {
+      try {
+        const offerRes = await c.query(`SELECT * FROM noncustodial_collateral_offers WHERE id=$1 FOR UPDATE`, [id]);
+        if (!offerRes.rowCount) throw new Error('offer not found');
+        const offer = offerRes.rows[0];
+        if (!['OFFERED','LOCK_PROOF_SUBMITTED'].includes(offer.status)) throw new Error(`offer status ${offer.status} cannot accept proof`);
+        if (amountSats < Number(offer.collateral_sats)) throw new Error(`proof amount ${amountSats} below required collateral ${offer.collateral_sats}`);
+        const proof = {
+          funding_txid: fundingTxid,
+          vout,
+          amount_sats: amountSats,
+          proof_type: body.proof_type || 'txid_vout',
+          submitted_at: new Date().toISOString(),
+          notes: body.notes || null
+        };
+        await c.query(`
+          UPDATE noncustodial_collateral_offers
+          SET status='LOCK_PROOF_SUBMITTED', lock_txid=$2, lock_vout=$3, lock_amount_sats=$4, lock_proof=$5,
+              verification_notes='Funding proof submitted. USDC release is blocked until verifier approval.', updated_at=NOW()
+          WHERE id=$1
+        `, [id, fundingTxid, vout, amountSats, proof]);
+        const finalOffer = await c.query(`SELECT * FROM noncustodial_collateral_offers WHERE id=$1`, [id]);
+        await c.query('COMMIT');
+        return { offer: finalOffer.rows[0], loan: null, usdc: null };
+      } catch (e) {
+        await c.query('ROLLBACK');
+        throw e;
+      }
+    });
+    return json(res, 200, { success: true, data: result, message: 'Collateral proof submitted. Loan and USDC release are waiting for verifier approval.' });
+  }
+
+  const verifyMatch = path.match(/^\/api\/v1\/noncustodial\/offers\/([^/]+)\/verify$/);
+  if (req.method === 'POST' && verifyMatch) {
+    const id = verifyMatch[1];
+    const body = await readBody(req);
+    const verifierKey = process.env.COLLATERAL_VERIFIER_KEY;
+    if (verifierKey && body.verifier_key !== verifierKey) return json(res, 403, { success: false, error: 'invalid verifier_key' });
+    if (!body.verification_evidence && !body.manual_verifier) return json(res, 400, { success: false, error: 'verification_evidence or manual_verifier required' });
+    const result = await db(async c => {
+      await c.query('BEGIN');
+      try {
+        const offerRes = await c.query(`SELECT * FROM noncustodial_collateral_offers WHERE id=$1 FOR UPDATE`, [id]);
+        if (!offerRes.rowCount) throw new Error('offer not found');
+        const offer = offerRes.rows[0];
+        if (offer.status === 'LOAN_OPENED' && offer.loan_id) {
+          const existingLoan = await c.query(`SELECT * FROM loans WHERE id=$1`, [offer.loan_id]);
+          const existingUsdc = await c.query(`SELECT * FROM usdc_disbursements WHERE loan_id=$1`, [offer.loan_id]);
+          await c.query('COMMIT');
+          return { offer, loan: existingLoan.rows[0] || null, usdc: existingUsdc.rows[0] || null };
+        }
+        if (offer.status !== 'LOCK_PROOF_SUBMITTED') throw new Error(`offer status ${offer.status} cannot be verified`);
+        if (!offer.lock_txid || offer.lock_vout === null || Number(offer.lock_amount_sats || 0) < Number(offer.collateral_sats)) throw new Error('complete lock proof required before verification');
         const loanRes = await c.query(`
           INSERT INTO loans (
             borrower_id, collateral_sats, collateral_payment_hash, collateral_confirmed_at,
@@ -331,24 +365,30 @@ async function route(req, res) {
             status, expires_at, loan_opened_at, created_at, updated_at
           ) VALUES ($1,$2,$3,NOW(),$4,$5,0.50,0.18,$6,'ACTIVE',NOW() + INTERVAL '90 days',NOW(),NOW(),NOW())
           RETURNING *
-        `, [offer.borrower_id, offer.collateral_sats, fundingTxid, offer.principal_usd, offer.protocol_fee_usd, offer.btc_price_usd]);
-        loan = loanRes.rows[0];
+        `, [offer.borrower_id, offer.collateral_sats, offer.lock_txid, offer.principal_usd, offer.protocol_fee_usd, offer.btc_price_usd]);
+        const loan = loanRes.rows[0];
         const usdcRes = await c.query(`
           INSERT INTO usdc_disbursements (loan_id, borrower_id, amount_usdc, network, status, notes, rail)
           VALUES ($1,$2,$3,'UNSET','PENDING','Awaiting USDC recipient before automated disbursement.','evm_erc20')
           ON CONFLICT (loan_id) DO UPDATE SET amount_usdc=EXCLUDED.amount_usdc, updated_at=NOW()
           RETURNING *
         `, [loan.id, offer.borrower_id, offer.principal_usd]);
-        usdc = usdcRes.rows[0];
-        await c.query(`UPDATE noncustodial_collateral_offers SET status='LOAN_OPENED', loan_id=$2, updated_at=NOW() WHERE id=$1`, [id, loan.id]);
+        const evidence = body.verification_evidence || { manual_verifier: body.manual_verifier };
+        await c.query(`
+          UPDATE noncustodial_collateral_offers
+          SET status='LOAN_OPENED', loan_id=$2, lock_verified_at=NOW(),
+              verification_notes=$3, updated_at=NOW()
+          WHERE id=$1
+        `, [id, loan.id, `Verified by collateral verifier. Evidence: ${JSON.stringify(evidence).slice(0, 1000)}`]);
+        const finalOffer = await c.query(`SELECT * FROM noncustodial_collateral_offers WHERE id=$1`, [id]);
+        await c.query('COMMIT');
+        return { offer: finalOffer.rows[0], loan, usdc: usdcRes.rows[0] };
+      } catch (e) {
+        await c.query('ROLLBACK');
+        throw e;
       }
-      const finalOffer = await c.query(`SELECT * FROM noncustodial_collateral_offers WHERE id=$1`, [id]);
-      await c.query('COMMIT');
-      return { offer: finalOffer.rows[0], loan, usdc };
-    }).catch(async err => {
-      throw err;
     });
-    return json(res, 200, { success: true, data: result, message: result.loan ? 'Collateral proof accepted and loan opened without Loop custody of borrower BTC.' : 'Collateral proof submitted.' });
+    return json(res, 200, { success: true, data: result, message: 'Collateral lock verified. Loan opened and USDC disbursement is now pending recipient details.' });
   }
 
   if (req.method === 'GET' && path === '/api/v1/dashboard/summary') {

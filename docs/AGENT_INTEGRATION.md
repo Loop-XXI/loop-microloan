@@ -13,8 +13,8 @@ The old Phoenixd collateral flow is test infrastructure only.
 1. Agent requests a non-custodial collateral offer.
 2. Agent wallet funds the returned Bitcoin contract terms.
 3. Agent submits funding proof.
-4. Protocol verifier accepts the proof and opens the loan.
-5. Loop USDC rail disburses funds to the configured recipient.
+4. Protocol verifier accepts the proof and opens the loan. Proof submission alone never releases USDC.
+5. Loop USDC rail disburses funds to the configured recipient after verification.
 6. Agent polls status and repays when ready.
 7. Contract releases collateral according to repayment/default conditions.
 
@@ -115,16 +115,29 @@ Request:
 }
 ```
 
-Response when verifier opens a loan:
+Response after proof submission:
 
 ```json
 {
   "success": true,
-  "message": "Collateral proof accepted and loan opened without Loop custody of borrower BTC.",
+  "message": "Collateral proof submitted. Loan and USDC release are waiting for verifier approval.",
   "data": {
-    "offer": { "status": "LOAN_OPENED" },
-    "loan": { "id": "loan-uuid", "status": "ACTIVE" },
-    "usdc": { "status": "PENDING" }
+    "offer": { "status": "LOCK_PROOF_SUBMITTED" },
+    "loan": null,
+    "usdc": null
+  }
+}
+```
+
+### POST `/api/v1/noncustodial/offers/:id/verify`
+
+Verifier-only endpoint. Opens the loan after the non-custodial BTC lock is verified.
+
+```json
+{
+  "verification_evidence": {
+    "method": "spv_or_dlc_verifier",
+    "confirmations": 1
   }
 }
 ```
@@ -160,4 +173,4 @@ Creates a Lightning repayment invoice for principal + accrued interest.
 
 ## Production verifier requirement
 
-The v0 bridge can auto-verify testnet/regtest/mutinynet proof for development. Mainnet production must replace this with SPV, DLC, or equivalent contract verification before USDC is released.
+The bridge no longer auto-opens loans from submitted txids. A verifier step is required. Mainnet production must use SPV, DLC, or equivalent contract verification before USDC is released.

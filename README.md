@@ -43,7 +43,7 @@ pnpm dev
 ## Product Surfaces
 
 - `/` — Loop XXI branded product home
-- `/borrow` — human borrower flow for non-custodial collateral offers
+- `/borrow` — simple human flow: choose terms, get Bitcoin vault address, submit funding txid
 - `/agent` — agent JSON API guide
 - `/app` — admin portfolio dashboard
 - `/app/offers` — non-custodial offer/proof queue
@@ -56,6 +56,7 @@ loop-microloan/
 ├── api/               # Go backend
 ├── web/               # Next.js frontend
 ├── supabase/          # Migrations
+├── packages/agent-plugin/ # TypeScript helper for autonomous agents
 └── docs/              # Protocol spec and agent integration guide
 ```
 

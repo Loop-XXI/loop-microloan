@@ -31,7 +31,8 @@ export async function requestOffer(agentId: string, collateralSats: number) {
       borrower_identifier: agentId,
       identifier_type: 'agent_id',
       collateral_sats: collateralSats,
-      bitcoin_network: 'bitcoin_mainnet'
+      bitcoin_network: 'bitcoin_mainnet',
+      borrower_pubkey: '02...compressed_secp256k1_pubkey'
     })
   })
   return res.json()
@@ -69,7 +70,8 @@ Request:
   "borrower_identifier": "agent:demo-001",
   "identifier_type": "agent_id",
   "collateral_sats": 50000,
-  "bitcoin_network": "bitcoin_mainnet"
+  "bitcoin_network": "bitcoin_mainnet",
+  "borrower_pubkey": "02...compressed_secp256k1_pubkey"
 }
 ```
 
@@ -84,10 +86,13 @@ Response:
     "collateral_sats": "50000",
     "principal_usd": "15.0000",
     "protocol_fee_usd": "0.0750",
-    "contract_type": "taproot_escrow_v0",
+    "contract_type": "p2wsh_escrow_v1",
     "bitcoin_network": "bitcoin_mainnet",
     "contract_terms": {
       "custody": "non_custodial",
+      "collateral_address": "bc1... or tb1...",
+      "script_pubkey_hex": "0020...",
+      "witness_script_hex": "...",
       "descriptor_hash": "0x...",
       "proof_required": {
         "funding_txid": "64-character transaction id funding the borrower-controlled contract output",
@@ -131,14 +136,11 @@ Response after proof submission:
 
 ### POST `/api/v1/noncustodial/offers/:id/verify`
 
-Verifier-only endpoint. Opens the loan after the non-custodial BTC lock is verified.
+Verifier endpoint. Opens the loan only after the backend verifies the funding output matches the generated collateral address/script/value using a Bitcoin explorer/SPV verifier. Manual override is disabled unless explicitly enabled in environment.
 
 ```json
 {
-  "verification_evidence": {
-    "method": "spv_or_dlc_verifier",
-    "confirmations": 1
-  }
+  "min_confirmations": 1
 }
 ```
 
@@ -173,4 +175,4 @@ Creates a Lightning repayment invoice for principal + accrued interest.
 
 ## Production verifier requirement
 
-The bridge no longer auto-opens loans from submitted txids. A verifier step is required. Mainnet production must use SPV, DLC, or equivalent contract verification before USDC is released.
+The bridge no longer auto-opens loans from submitted txids. A verifier step is required. The current verifier checks mempool.space output address/script/value/confirmations for mainnet and testnet. Production should replace or augment this with first-party Bitcoin Core/SPV/DLC verification before USDC release.

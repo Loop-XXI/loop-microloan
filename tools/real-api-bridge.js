@@ -2,6 +2,7 @@ const http = require('http');
 const { URL } = require('url');
 const { Client } = require('pg');
 const { ethers } = require('ethers');
+const crypto = require('crypto');
 
 const PORT = Number(process.env.PORT || 8091);
 const rawDbUrl = process.env.DATABASE_URL || process.env.SUPABASE_DB_URL || process.env.SUPABASE_URL;
@@ -89,6 +90,157 @@ function makeContractTerms({ offerId, borrowerIdentifier, collateralSats, princi
 
 function validTxid(txid) {
   return typeof txid === 'string' && /^[0-9a-fA-F]{64}$/.test(txid);
+}
+
+function validCompressedPubkey(pubkey) {
+  return typeof pubkey === 'string' && /^(02|03)[0-9a-fA-F]{64}$/.test(pubkey);
+}
+
+function sha256(buf) { return crypto.createHash('sha256').update(buf).digest(); }
+function hex(buf) { return Buffer.from(buf).toString('hex'); }
+function pushData(buf) { return Buffer.concat([Buffer.from([buf.length]), Buffer.from(buf)]); }
+function scriptNum(n) {
+  if (n === 0) return Buffer.alloc(0);
+  const out = [];
+  let v = n;
+  while (v > 0) { out.push(v & 0xff); v >>= 8; }
+  if (out[out.length - 1] & 0x80) out.push(0);
+  return Buffer.from(out);
+}
+function opPushNum(n) { const b = scriptNum(n); return Buffer.concat([Buffer.from([b.length]), b]); }
+
+const BECH32 = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+function bech32Polymod(values) {
+  const gen = [0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3];
+  let chk = 1;
+  for (const v of values) {
+    const top = chk >> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ v;
+    for (let i=0;i<5;i++) if ((top >> i) & 1) chk ^= gen[i];
+  }
+  return chk;
+}
+function bech32HrpExpand(hrp) {
+  const out = [];
+  for (let i=0;i<hrp.length;i++) out.push(hrp.charCodeAt(i) >> 5);
+  out.push(0);
+  for (let i=0;i<hrp.length;i++) out.push(hrp.charCodeAt(i) & 31);
+  return out;
+}
+function bech32CreateChecksum(hrp, data) {
+  const values = bech32HrpExpand(hrp).concat(data).concat([0,0,0,0,0,0]);
+  const mod = bech32Polymod(values) ^ 1;
+  const ret = [];
+  for (let p=0;p<6;p++) ret.push((mod >> 5 * (5 - p)) & 31);
+  return ret;
+}
+function bech32Encode(hrp, data) {
+  const combined = data.concat(bech32CreateChecksum(hrp, data));
+  return hrp + '1' + combined.map(v => BECH32[v]).join('');
+}
+function convertBits(data, from, to, pad = true) {
+  let acc = 0, bits = 0;
+  const ret = [];
+  const maxv = (1 << to) - 1;
+  for (const value of data) {
+    acc = (acc << from) | value;
+    bits += from;
+    while (bits >= to) { bits -= to; ret.push((acc >> bits) & maxv); }
+  }
+  if (pad && bits) ret.push((acc << (to - bits)) & maxv);
+  return ret;
+}
+function segwitAddress(hrp, version, program) {
+  return bech32Encode(hrp, [version].concat(convertBits([...program], 8, 5, true)));
+}
+function networkParams(bitcoinNetwork) {
+  if (bitcoinNetwork === 'bitcoin_mainnet') return { hrp: 'bc', mempool: 'https://mempool.space/api' };
+  if (bitcoinNetwork === 'bitcoin_regtest') return { hrp: 'bcrt', mempool: null };
+  return { hrp: 'tb', mempool: 'https://mempool.space/testnet/api' };
+}
+function getOrCreateLoopCollateralKey() {
+  if (process.env.LOOP_COLLATERAL_PRIVKEY_HEX) {
+    const ecdh = crypto.createECDH('secp256k1');
+    ecdh.setPrivateKey(Buffer.from(process.env.LOOP_COLLATERAL_PRIVKEY_HEX, 'hex'));
+    return { privateKeyHex: process.env.LOOP_COLLATERAL_PRIVKEY_HEX, publicKeyHex: hex(ecdh.getPublicKey(null, 'compressed')) };
+  }
+  const ecdh = crypto.createECDH('secp256k1');
+  ecdh.generateKeys();
+  return { privateKeyHex: null, publicKeyHex: hex(ecdh.getPublicKey(null, 'compressed')) };
+}
+async function getTipHeight(bitcoinNetwork) {
+  const params = networkParams(bitcoinNetwork);
+  if (!params.mempool) return 1000;
+  try { const r = await fetch(`${params.mempool}/blocks/tip/height`); return Number(await r.text()); } catch { return 900000; }
+}
+function buildCollateralScript({ borrowerPubkeyHex, lenderPubkeyHex, lenderClaimHeight, borrowerRefundHeight }) {
+  const borrower = Buffer.from(borrowerPubkeyHex, 'hex');
+  const lender = Buffer.from(lenderPubkeyHex, 'hex');
+  return Buffer.concat([
+    Buffer.from([0x63]),                         // OP_IF cooperative
+      Buffer.from([0x52]), pushData(borrower), pushData(lender), Buffer.from([0x52, 0xae]),
+    Buffer.from([0x67, 0x63]),                   // OP_ELSE OP_IF lender maturity claim
+      opPushNum(lenderClaimHeight), Buffer.from([0xb1, 0x75]), pushData(lender), Buffer.from([0xac]),
+    Buffer.from([0x67]),                         // OP_ELSE borrower long refund
+      opPushNum(borrowerRefundHeight), Buffer.from([0xb1, 0x75]), pushData(borrower), Buffer.from([0xac]),
+    Buffer.from([0x68, 0x68])                    // OP_ENDIF OP_ENDIF
+  ]);
+}
+async function makeRealCollateralTerms({ offerId, borrowerIdentifier, collateralSats, principalUSD, btcPrice, bitcoinNetwork, borrowerPubkeyHex }) {
+  const keys = getOrCreateLoopCollateralKey();
+  const tip = await getTipHeight(bitcoinNetwork);
+  const lenderClaimHeight = tip + 90 * 144;
+  const borrowerRefundHeight = tip + 180 * 144;
+  const witnessScript = buildCollateralScript({ borrowerPubkeyHex, lenderPubkeyHex: keys.publicKeyHex, lenderClaimHeight, borrowerRefundHeight });
+  const scriptHash = sha256(witnessScript);
+  const params = networkParams(bitcoinNetwork);
+  const address = segwitAddress(params.hrp, 0, scriptHash);
+  const scriptPubKey = Buffer.concat([Buffer.from([0x00, 0x20]), scriptHash]);
+  return {
+    version: 'p2wsh_escrow_v1',
+    custody: 'non_custodial',
+    borrower_identifier: borrowerIdentifier,
+    borrower_pubkey: borrowerPubkeyHex,
+    loop_lender_pubkey: keys.publicKeyHex,
+    collateral_sats: collateralSats,
+    principal_usd: Number(principalUSD.toFixed(4)),
+    btc_price_usd: Number(btcPrice.toFixed(4)),
+    ltv: 0.5,
+    apr: 0.18,
+    bitcoin_network: bitcoinNetwork,
+    collateral_address: address,
+    script_pubkey_hex: hex(scriptPubKey),
+    witness_script_hex: hex(witnessScript),
+    descriptor_hash: '0x' + hex(scriptHash),
+    current_tip_height: tip,
+    lender_claim_after_height: lenderClaimHeight,
+    borrower_refund_after_height: borrowerRefundHeight,
+    paths: {
+      cooperative_repay_release: '2-of-2 borrower + Loop signatures release collateral after repayment',
+      lender_default_claim: `Loop can claim only after block ${lenderClaimHeight} if loan defaults`,
+      borrower_safety_refund: `Borrower can recover after block ${borrowerRefundHeight} if Loop disappears`
+    },
+    proof_required: { funding_txid: 'txid funding collateral_address', vout: 'output index', amount_sats: collateralSats, script_pubkey_hex: hex(scriptPubKey) },
+    warning: 'Mainnet verifier checks the funding output before USDC release. Lightning hold invoices are not durable loan collateral.'
+  };
+}
+async function verifyFundingOutput(offer, minConfirmations = 1) {
+  const params = networkParams(offer.bitcoin_network);
+  if (!params.mempool) throw new Error('automatic funding verification unavailable for regtest');
+  const txid = offer.lock_txid;
+  if (!validTxid(txid)) throw new Error('valid lock_txid required');
+  const txRes = await fetch(`${params.mempool}/tx/${txid}`);
+  if (!txRes.ok) throw new Error(`transaction not found on ${offer.bitcoin_network}`);
+  const tx = await txRes.json();
+  const out = tx.vout?.[Number(offer.lock_vout)];
+  if (!out) throw new Error('funding output vout not found');
+  const terms = offer.contract_terms || {};
+  if (out.scriptpubkey !== terms.script_pubkey_hex && out.scriptpubkey_address !== terms.collateral_address) throw new Error('funding output does not match collateral contract');
+  if (Number(out.value) < Number(offer.collateral_sats)) throw new Error('funding output amount below required collateral');
+  const confirmed = Boolean(tx.status?.confirmed);
+  const confirmations = confirmed ? Math.max(1, (await getTipHeight(offer.bitcoin_network)) - Number(tx.status.block_height || 0) + 1) : 0;
+  if (confirmations < minConfirmations) throw new Error(`insufficient confirmations: ${confirmations}/${minConfirmations}`);
+  return { txid, vout: Number(offer.lock_vout), value: Number(out.value), confirmations, block_height: tx.status?.block_height || null, address: out.scriptpubkey_address };
 }
 
 function computedLoan(row, btcPrice) {
@@ -245,28 +397,26 @@ async function route(req, res) {
     const identifierType = body.identifier_type || 'agent_id';
     const collateralSats = Number(body.collateral_sats || 0);
     const bitcoinNetwork = body.bitcoin_network || 'bitcoin_mainnet';
+    const borrowerPubkey = String(body.borrower_pubkey || '').trim();
     if (!borrowerIdentifier) return json(res, 400, { success: false, error: 'borrower_identifier required' });
     if (!['agent_id', 'lightning_pubkey', 'human'].includes(identifierType)) return json(res, 400, { success: false, error: 'identifier_type must be agent_id, lightning_pubkey, or human' });
     if (collateralSats < 50000 || collateralSats > 2000000) return json(res, 400, { success: false, error: 'collateral_sats must be between 50,000 and 2,000,000' });
     if (!['bitcoin_mainnet', 'bitcoin_testnet', 'bitcoin_regtest', 'mutinynet'].includes(bitcoinNetwork)) return json(res, 400, { success: false, error: 'unsupported bitcoin_network' });
+    if (!validCompressedPubkey(borrowerPubkey)) return json(res, 400, { success: false, error: 'borrower_pubkey must be a compressed secp256k1 public key (02/03 + 64 hex chars)' });
     const btcPrice = await currentBTCPrice();
     const principalUSD = collateralSats * btcPrice / 100000000 * 0.50;
     const protocolFeeUSD = principalUSD * 0.005;
     const offer = await db(async c => {
       const borrower = await ensureBorrower(c, borrowerIdentifier, identifierType);
-      const seed = ethers.keccak256(ethers.toUtf8Bytes(`${borrower.id}:${Date.now()}:${Math.random()}`));
-      const terms = makeContractTerms({ offerId: seed, borrowerIdentifier, collateralSats, principalUSD, btcPrice, bitcoinNetwork });
+      const terms = await makeRealCollateralTerms({ offerId: 'pending', borrowerIdentifier, collateralSats, principalUSD, btcPrice, bitcoinNetwork, borrowerPubkeyHex: borrowerPubkey });
       const r = await c.query(`
         INSERT INTO noncustodial_collateral_offers (
           borrower_id, collateral_sats, principal_usd, protocol_fee_usd, btc_price_usd,
           ltv, annual_interest_rate, status, contract_type, bitcoin_network, contract_terms, offer_expires_at
-        ) VALUES ($1,$2,$3,$4,$5,0.50,0.18,'OFFERED','taproot_escrow_v0',$6,$7,NOW() + INTERVAL '2 hours')
+        ) VALUES ($1,$2,$3,$4,$5,0.50,0.18,'OFFERED','p2wsh_escrow_v1',$6,$7,NOW() + INTERVAL '2 hours')
         RETURNING *
       `, [borrower.id, collateralSats, principalUSD, protocolFeeUSD, btcPrice, bitcoinNetwork, terms]);
-      const saved = r.rows[0];
-      const finalTerms = makeContractTerms({ offerId: saved.id, borrowerIdentifier, collateralSats, principalUSD, btcPrice, bitcoinNetwork });
-      const updated = await c.query(`UPDATE noncustodial_collateral_offers SET contract_terms=$2 WHERE id=$1 RETURNING *`, [saved.id, finalTerms]);
-      return { ...updated.rows[0], borrower_identifier: borrower.identifier, identifier_type: borrower.identifier_type };
+      return { ...r.rows[0], borrower_identifier: borrower.identifier, identifier_type: borrower.identifier_type };
     });
     return json(res, 201, { success: true, data: offer, message: 'Non-custodial collateral offer created. Borrower keeps control of BTC until contract conditions are met.' });
   }
@@ -343,7 +493,6 @@ async function route(req, res) {
     const body = await readBody(req);
     const verifierKey = process.env.COLLATERAL_VERIFIER_KEY;
     if (verifierKey && body.verifier_key !== verifierKey) return json(res, 403, { success: false, error: 'invalid verifier_key' });
-    if (!body.verification_evidence && !body.manual_verifier) return json(res, 400, { success: false, error: 'verification_evidence or manual_verifier required' });
     const result = await db(async c => {
       await c.query('BEGIN');
       try {
@@ -358,6 +507,12 @@ async function route(req, res) {
         }
         if (offer.status !== 'LOCK_PROOF_SUBMITTED') throw new Error(`offer status ${offer.status} cannot be verified`);
         if (!offer.lock_txid || offer.lock_vout === null || Number(offer.lock_amount_sats || 0) < Number(offer.collateral_sats)) throw new Error('complete lock proof required before verification');
+        let evidence;
+        if (body.manual_verifier && process.env.ALLOW_MANUAL_COLLATERAL_VERIFY === 'true') {
+          evidence = { method: 'manual_dev_override', verifier: body.manual_verifier, warning: 'manual override enabled by environment' };
+        } else {
+          evidence = await verifyFundingOutput(offer, Number(body.min_confirmations ?? (offer.bitcoin_network === 'bitcoin_mainnet' ? 1 : 0)));
+        }
         const loanRes = await c.query(`
           INSERT INTO loans (
             borrower_id, collateral_sats, collateral_payment_hash, collateral_confirmed_at,
@@ -373,7 +528,6 @@ async function route(req, res) {
           ON CONFLICT (loan_id) DO UPDATE SET amount_usdc=EXCLUDED.amount_usdc, updated_at=NOW()
           RETURNING *
         `, [loan.id, offer.borrower_id, offer.principal_usd]);
-        const evidence = body.verification_evidence || { manual_verifier: body.manual_verifier };
         await c.query(`
           UPDATE noncustodial_collateral_offers
           SET status='LOAN_OPENED', loan_id=$2, lock_verified_at=NOW(),

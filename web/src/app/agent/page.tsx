@@ -10,9 +10,9 @@ export default function AgentPage() {
         </header>
 
         <section className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <Block title="1. Create offer" code={`POST ${api}/noncustodial/offers\n{\n  "borrower_identifier": "agent:demo-001",\n  "identifier_type": "agent_id",\n  "collateral_sats": 50000,\n  "bitcoin_network": "bitcoin_testnet"\n}`} />
+          <Block title="1. Create offer" code={`POST ${api}/noncustodial/offers\n{\n  "borrower_identifier": "agent:demo-001",\n  "identifier_type": "agent_id",\n  "collateral_sats": 50000,\n  "bitcoin_network": "bitcoin_testnet",\n  "borrower_pubkey": "02...compressed_pubkey"\n}\n\n# returns collateral_address + witness_script_hex`} />
           <Block title="2. Submit lock proof" code={`POST ${api}/noncustodial/offers/{offer_id}/proof\n{\n  "funding_txid": "<64-hex-txid>",\n  "vout": 0,\n  "amount_sats": 50000,\n  "proof_type": "txid_vout"\n}\n\n# returns LOCK_PROOF_SUBMITTED, not a loan yet`} />
-          <Block title="3. Verifier opens loan" code={`POST ${api}/noncustodial/offers/{offer_id}/verify\n{\n  "verification_evidence": {\n    "method": "spv_or_dlc_verifier",\n    "confirmations": 1\n  }\n}`} />
+          <Block title="3. Verifier opens loan" code={`POST ${api}/noncustodial/offers/{offer_id}/verify\n{\n  "min_confirmations": 1\n}\n\n# backend checks mempool.space output address/script/value`} />
           <Block title="4. Poll loan status / repay" code={`GET ${api}/loans/{loan_id}/status\nPOST ${api}/loans/{loan_id}/repay`} />
         </section>
 

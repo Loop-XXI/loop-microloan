@@ -7,6 +7,7 @@ export default function BorrowPage() {
   const [borrower, setBorrower] = useState("human-demo-user");
   const [collateralSats, setCollateralSats] = useState(50000);
   const [network, setNetwork] = useState("bitcoin_testnet");
+  const [borrowerPubkey, setBorrowerPubkey] = useState("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
   const [offer, setOffer] = useState<any>(null);
   const [proofResult, setProofResult] = useState<any>(null);
   const [fundingTxid, setFundingTxid] = useState("");
@@ -24,7 +25,7 @@ export default function BorrowPage() {
     setLoading(true);
     setMessage(null);
     setProofResult(null);
-    const res = await createNoncustodialOffer({ borrower_identifier: borrower, identifier_type: "human", collateral_sats: collateralSats, bitcoin_network: network });
+    const res = await createNoncustodialOffer({ borrower_identifier: borrower, identifier_type: "human", collateral_sats: collateralSats, bitcoin_network: network, borrower_pubkey: borrowerPubkey });
     setLoading(false);
     if (!res.success) return setMessage(res.error || "Offer request failed");
     setOffer(res.data);
@@ -58,6 +59,7 @@ export default function BorrowPage() {
             <label className="space-y-1"><span className="text-sm text-loop-muted">Collateral sats</span><input type="number" min={50000} max={2000000} value={collateralSats} onChange={(e) => setCollateralSats(Number(e.target.value))} className="w-full bg-loop-dark border border-gray-700 rounded px-3 py-2" /></label>
             <label className="space-y-1"><span className="text-sm text-loop-muted">Bitcoin network</span><select value={network} onChange={(e) => setNetwork(e.target.value)} className="w-full bg-loop-dark border border-gray-700 rounded px-3 py-2"><option value="bitcoin_testnet">Bitcoin testnet</option><option value="mutinynet">Mutinynet</option><option value="bitcoin_regtest">Regtest</option><option value="bitcoin_mainnet">Bitcoin mainnet</option></select></label>
             <div className="grid grid-cols-2 gap-3"><Stat label="Estimated USDC" value={`$${estimate.principal.toFixed(2)}`} /><Stat label="APR" value="18%" /></div>
+            <label className="space-y-1 md:col-span-2"><span className="text-sm text-loop-muted">Your Bitcoin public key</span><input value={borrowerPubkey} onChange={(e) => setBorrowerPubkey(e.target.value)} className="w-full bg-loop-dark border border-gray-700 rounded px-3 py-2 font-mono" /><span className="text-xs text-loop-muted">Paste a compressed secp256k1 public key from your wallet. The default is test-only and not safe for real funds.</span></label>
           </div>
           <button onClick={requestOffer} disabled={loading || !borrower} className="rounded bg-white text-black font-semibold px-4 py-2 disabled:opacity-40">{loading ? "Working..." : "Create offer"}</button>
         </section>
@@ -67,7 +69,7 @@ export default function BorrowPage() {
           {!offer ? <p className="text-loop-muted">Create an offer first. No sats are sent to Loop.</p> : (
             <div className="space-y-3">
               <div className="grid grid-cols-1 md:grid-cols-3 gap-3"><Stat label="Offer status" value={offer.status} /><Stat label="Required collateral" value={`${Number(offer.collateral_sats).toLocaleString()} sats`} /><Stat label="USDC available" value={`$${Number(offer.principal_usd).toFixed(2)}`} /></div>
-              <div className="rounded-lg bg-loop-dark border border-gray-800 p-4"><div className="text-sm text-loop-muted mb-1">Contract package hash</div><div className="font-mono text-sm break-all">{offer.contract_terms?.descriptor_hash}</div></div>
+              <div className="rounded-lg bg-loop-dark border border-gray-800 p-4 space-y-2"><div><div className="text-sm text-loop-muted mb-1">Fund this collateral address</div><div className="font-mono text-sm break-all">{offer.contract_terms?.collateral_address}</div></div><div><div className="text-sm text-loop-muted mb-1">Contract package hash</div><div className="font-mono text-sm break-all">{offer.contract_terms?.descriptor_hash}</div></div></div>
               <div className="rounded-lg border border-gray-800 p-4 text-sm text-loop-muted">Production path: wallet creates/funds a Taproot/DLC-style collateral output matching this offer. Lightning can be used for repayment, but durable collateral should be Bitcoin script/DLC, not a custodial Lightning invoice.</div>
             </div>
           )}

@@ -99,6 +99,7 @@ export async function createNoncustodialOffer(body: {
   identifier_type: "human" | "agent_id" | "lightning_pubkey";
   collateral_sats: number;
   bitcoin_network?: string;
+  borrower_pubkey: string;
 }) {
   const res = await fetch(`${API_BASE}/noncustodial/offers`, {
     method: "POST",

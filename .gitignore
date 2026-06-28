@@ -1,0 +1,24 @@
+# Go
+*.exe
+*.out
+*.test
+vendor/
+.env
+.env.local
+api/tmp/
+
+# Next.js
+node_modules/
+.next/
+out/
+*.log
+
+# Supabase
+.supabase/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store

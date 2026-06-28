@@ -1,134 +1,47 @@
-"use client";
-
-import { useState } from "react";
-import { openLoan } from "@/lib/api";
-
 export default function LandingPage() {
-  const [identifier, setIdentifier] = useState("");
-  const [sats, setSats] = useState(100000);
-  const [result, setResult] = useState<any>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-
-  async function handleOpenLoan(e: React.FormEvent) {
-    e.preventDefault();
-    setLoading(true);
-    setError("");
-    setResult(null);
-    try {
-      const data = await openLoan({
-        borrower_identifier: identifier,
-        collateral_sats: sats,
-        identifier_type: "agent_id",
-      });
-      if (data.error) {
-        setError(data.error);
-      } else {
-        setResult(data);
-      }
-    } catch (err: any) {
-      setError(err.message);
-    }
-    setLoading(false);
-  }
-
-  const btcPrice = 57000;
-  const estLoan = (sats * 0.5) / 1e8 * btcPrice;
-  const protocolFee = estLoan * 0.005;
-
   return (
-    <main className="max-w-3xl mx-auto px-6 py-16">
-      <h1 className="text-4xl font-bold mb-4">Loop Microloan</h1>
-      <p className="text-loop-muted mb-10">
-        Deposit sats via Lightning. Receive USDC. Repay on your schedule.
-        Automatic liquidation at 80% LTV.
-      </p>
+    <main className="min-h-screen bg-loop-dark text-white">
+      <section className="mx-auto max-w-6xl px-6 py-16 space-y-16">
+        <header className="space-y-6">
+          <div className="text-sm uppercase tracking-[0.35em] text-loop-muted">Loop XXI</div>
+          <div className="space-y-4 max-w-4xl">
+            <h1 className="text-5xl md:text-7xl font-semibold tracking-tight">Bitcoin collateral. USDC liquidity. No custody of user sats.</h1>
+            <p className="text-xl text-loop-muted max-w-3xl">
+              Loop Microloan is a non-custodial layer-2 microloan protocol for humans and autonomous agents. Borrowers lock BTC under contract terms and receive USDC from Loop treasury liquidity.
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-3">
+            <a href="/borrow" className="rounded bg-white text-black px-5 py-3 font-semibold">Test Human Borrower Flow</a>
+            <a href="/agent" className="rounded border border-gray-700 px-5 py-3 font-semibold">Agent API Guide</a>
+            <a href="/app" className="rounded border border-gray-700 px-5 py-3 font-semibold">Admin Dashboard</a>
+          </div>
+        </header>
 
-      <section className="bg-loop-panel rounded-xl p-6 mb-10">
-        <h2 className="text-xl font-semibold mb-4">Loan Calculator</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <label className="flex flex-col">
-            <span className="text-sm text-loop-muted mb-1">Collateral (sats)</span>
-            <input
-              type="number"
-              min={50000}
-              max={2000000}
-              value={sats}
-              onChange={(e) => setSats(Number(e.target.value))}
-              className="bg-loop-dark border border-gray-700 rounded-lg px-4 py-2"
-            />
-          </label>
-          <div className="flex flex-col">
-            <span className="text-sm text-loop-muted mb-1">Estimated USDC</span>
-            <div className="text-2xl font-mono">${estLoan.toFixed(2)}</div>
+        <section className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <Card title="Non-custodial collateral" body="BTC collateral remains controlled by contract conditions, not a Loop wallet. Phoenixd custody is test infrastructure only." />
+          <Card title="Automated USDC payout" body="Loop treasury liquidity pays USDC on Base through an auditable EVM rail with full attempt logs." />
+          <Card title="Human + agent native" body="Humans get a guided UI. Agents get deterministic JSON endpoints for offers, proofs, status, and repayment." />
+        </section>
+
+        <section className="bg-loop-panel rounded-2xl border border-gray-800 p-6 space-y-4">
+          <h2 className="text-2xl font-semibold">Protocol lifecycle</h2>
+          <div className="grid grid-cols-1 md:grid-cols-5 gap-3 text-sm">
+            <Step n="1" title="Request" body="Human or agent requests terms." />
+            <Step n="2" title="Lock" body="Borrower funds a non-custodial BTC contract." />
+            <Step n="3" title="Verify" body="Protocol verifies funding proof." />
+            <Step n="4" title="Disburse" body="Loop sends USDC from treasury liquidity." />
+            <Step n="5" title="Repay" body="Borrower repays and contract releases collateral." />
           </div>
-          <div className="flex flex-col">
-            <span className="text-sm text-loop-muted mb-1">Protocol Fee (0.5%)</span>
-            <div className="text-lg font-mono text-loop-warning">${protocolFee.toFixed(2)}</div>
-          </div>
-          <div className="flex flex-col">
-            <span className="text-sm text-loop-muted mb-1">APR</span>
-            <div className="text-lg font-mono">18%</div>
-          </div>
-        </div>
+        </section>
       </section>
-
-      <section className="bg-loop-panel rounded-xl p-6">
-        <h2 className="text-xl font-semibold mb-4">Open Loan</h2>
-        <form onSubmit={handleOpenLoan} className="flex flex-col gap-4">
-          <input
-            type="text"
-            placeholder="Agent ID or Lightning Pubkey"
-            className="bg-loop-dark border border-gray-700 rounded-lg px-4 py-2"
-            value={identifier}
-            onChange={(e) => setIdentifier(e.target.value)}
-            required
-          />
-          <button
-            type="submit"
-            disabled={loading || !identifier}
-            className="bg-loop-accent text-black font-semibold rounded-lg px-4 py-2 disabled:opacity-50"
-          >
-            {loading ? "Opening..." : "Get a Loan"}
-          </button>
-        </form>
-
-        {error && (
-          <div className="mt-6 p-4 bg-red-900/20 rounded-lg border border-red-800">
-            <p className="text-red-400 text-sm">{error}</p>
-          </div>
-        )}
-
-        {result && result.data && (
-          <div className="mt-6 p-4 bg-loop-dark rounded-lg border border-gray-700">
-            <p className="text-loop-accent font-semibold">{result.data.message}</p>
-            <div className="grid grid-cols-2 gap-2 mt-4 text-sm">
-              <div>
-                <span className="text-loop-muted">Loan ID: </span>
-                <span className="font-mono">{result.data.loan_id}</span>
-              </div>
-              <div>
-                <span className="text-loop-muted">Status: </span>
-                <span>{result.data.status}</span>
-              </div>
-              <div>
-                <span className="text-loop-muted">Loan USD: </span>
-                <span className="font-mono">${result.data.estimated_loan_usd}</span>
-              </div>
-              <div>
-                <span className="text-loop-muted">Fee: </span>
-                <span className="font-mono">${result.data.protocol_fee_usd}</span>
-              </div>
-            </div>
-            <p className="text-sm text-loop-muted mt-3">Collateral Invoice:</p>
-            <code className="break-all text-xs block mt-1 bg-loop-panel p-2 rounded">{result.data.collateral_invoice}</code>
-          </div>
-        )}
-      </section>
-
-      <div className="mt-10 text-center">
-        <a href="/app" className="text-loop-muted hover:text-white text-sm">Admin Dashboard</a>
-      </div>
     </main>
   );
+}
+
+function Card({ title, body }: { title: string; body: string }) {
+  return <div className="bg-loop-panel border border-gray-800 rounded-2xl p-5"><h3 className="font-semibold text-lg mb-2">{title}</h3><p className="text-loop-muted">{body}</p></div>;
+}
+
+function Step({ n, title, body }: { n: string; title: string; body: string }) {
+  return <div className="bg-loop-dark border border-gray-800 rounded-xl p-4"><div className="text-loop-muted text-xs">{n}</div><div className="font-semibold mb-1">{title}</div><div className="text-loop-muted">{body}</div></div>;
 }

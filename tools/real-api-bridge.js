@@ -45,6 +45,52 @@ async function currentBTCPrice() {
   return Number(j.data.amount);
 }
 
+async function ensureBorrower(client, identifier, identifierType = 'agent_id') {
+  const r = await client.query(`
+    INSERT INTO borrowers (identifier, identifier_type, updated_at)
+    VALUES ($1, $2, NOW())
+    ON CONFLICT (identifier) DO UPDATE SET identifier_type = EXCLUDED.identifier_type, updated_at = NOW()
+    RETURNING *
+  `, [identifier, identifierType]);
+  return r.rows[0];
+}
+
+function makeContractTerms({ offerId, borrowerIdentifier, collateralSats, principalUSD, btcPrice, bitcoinNetwork }) {
+  const now = Date.now();
+  const refundAfter = new Date(now + 2 * 60 * 60 * 1000).toISOString();
+  const maturity = new Date(now + 90 * 24 * 60 * 60 * 1000).toISOString();
+  const descriptorHash = ethers.keccak256(ethers.toUtf8Bytes(`${offerId}:${borrowerIdentifier}:${collateralSats}:${principalUSD}:${bitcoinNetwork}`));
+  return {
+    version: 'taproot_escrow_v0',
+    custody: 'non_custodial',
+    borrower_identifier: borrowerIdentifier,
+    collateral_sats: collateralSats,
+    principal_usd: Number(principalUSD.toFixed(4)),
+    btc_price_usd: Number(btcPrice.toFixed(4)),
+    ltv: 0.5,
+    apr: 0.18,
+    bitcoin_network: bitcoinNetwork,
+    descriptor_hash: descriptorHash,
+    paths: {
+      cooperative_repay_release: 'borrower + lender signature releases collateral after repayment',
+      borrower_refund: `borrower refund path available if USDC is not disbursed by ${refundAfter}`,
+      maturity_claim: `lender claim path only after default/maturity at ${maturity}`,
+      liquidation: 'DLC/oracle path required for production liquidation; v0 requires manual/test proof verification'
+    },
+    proof_required: {
+      funding_txid: '64-character transaction id funding the borrower-controlled contract output',
+      vout: 'output index of the contract UTXO',
+      amount_sats: collateralSats,
+      script_or_descriptor_hash: descriptorHash
+    },
+    warning: 'v0 test interface. Production requires SPV/DLC verification before USDC release.'
+  };
+}
+
+function validTxid(txid) {
+  return typeof txid === 'string' && /^[0-9a-fA-F]{64}$/.test(txid);
+}
+
 function computedLoan(row, btcPrice) {
   const principal = Number(row.principal_usd || 0);
   const collateral = Number(row.collateral_sats || 0);
@@ -192,6 +238,118 @@ async function route(req, res) {
   const path = u.pathname;
 
   if (path === '/health') return json(res, 200, { success: true, service: 'loop-microloan-real-api-bridge' });
+
+  if (req.method === 'POST' && path === '/api/v1/noncustodial/offers') {
+    const body = await readBody(req);
+    const borrowerIdentifier = String(body.borrower_identifier || '').trim();
+    const identifierType = body.identifier_type || 'agent_id';
+    const collateralSats = Number(body.collateral_sats || 0);
+    const bitcoinNetwork = body.bitcoin_network || 'bitcoin_mainnet';
+    if (!borrowerIdentifier) return json(res, 400, { success: false, error: 'borrower_identifier required' });
+    if (!['agent_id', 'lightning_pubkey', 'human'].includes(identifierType)) return json(res, 400, { success: false, error: 'identifier_type must be agent_id, lightning_pubkey, or human' });
+    if (collateralSats < 50000 || collateralSats > 2000000) return json(res, 400, { success: false, error: 'collateral_sats must be between 50,000 and 2,000,000' });
+    if (!['bitcoin_mainnet', 'bitcoin_testnet', 'bitcoin_regtest', 'mutinynet'].includes(bitcoinNetwork)) return json(res, 400, { success: false, error: 'unsupported bitcoin_network' });
+    const btcPrice = await currentBTCPrice();
+    const principalUSD = collateralSats * btcPrice / 100000000 * 0.50;
+    const protocolFeeUSD = principalUSD * 0.005;
+    const offer = await db(async c => {
+      const borrower = await ensureBorrower(c, borrowerIdentifier, identifierType);
+      const seed = ethers.keccak256(ethers.toUtf8Bytes(`${borrower.id}:${Date.now()}:${Math.random()}`));
+      const terms = makeContractTerms({ offerId: seed, borrowerIdentifier, collateralSats, principalUSD, btcPrice, bitcoinNetwork });
+      const r = await c.query(`
+        INSERT INTO noncustodial_collateral_offers (
+          borrower_id, collateral_sats, principal_usd, protocol_fee_usd, btc_price_usd,
+          ltv, annual_interest_rate, status, contract_type, bitcoin_network, contract_terms, offer_expires_at
+        ) VALUES ($1,$2,$3,$4,$5,0.50,0.18,'OFFERED','taproot_escrow_v0',$6,$7,NOW() + INTERVAL '2 hours')
+        RETURNING *
+      `, [borrower.id, collateralSats, principalUSD, protocolFeeUSD, btcPrice, bitcoinNetwork, terms]);
+      const saved = r.rows[0];
+      const finalTerms = makeContractTerms({ offerId: saved.id, borrowerIdentifier, collateralSats, principalUSD, btcPrice, bitcoinNetwork });
+      const updated = await c.query(`UPDATE noncustodial_collateral_offers SET contract_terms=$2 WHERE id=$1 RETURNING *`, [saved.id, finalTerms]);
+      return { ...updated.rows[0], borrower_identifier: borrower.identifier, identifier_type: borrower.identifier_type };
+    });
+    return json(res, 201, { success: true, data: offer, message: 'Non-custodial collateral offer created. Borrower keeps control of BTC until contract conditions are met.' });
+  }
+
+  if (req.method === 'GET' && path === '/api/v1/noncustodial/offers') {
+    const rows = await db(c => c.query(`
+      SELECT o.*, b.identifier borrower_identifier, b.identifier_type
+      FROM noncustodial_collateral_offers o
+      JOIN borrowers b ON b.id = o.borrower_id
+      ORDER BY o.created_at DESC
+      LIMIT 100
+    `));
+    return json(res, 200, { success: true, data: { offers: rows.rows } });
+  }
+
+  const offerMatch = path.match(/^\/api\/v1\/noncustodial\/offers\/([^/]+)$/);
+  if (req.method === 'GET' && offerMatch) {
+    const id = offerMatch[1];
+    const r = await db(c => c.query(`
+      SELECT o.*, b.identifier borrower_identifier, b.identifier_type
+      FROM noncustodial_collateral_offers o
+      JOIN borrowers b ON b.id = o.borrower_id
+      WHERE o.id=$1
+    `, [id]));
+    if (!r.rowCount) return json(res, 404, { success: false, error: 'offer not found' });
+    return json(res, 200, { success: true, data: r.rows[0] });
+  }
+
+  const proofMatch = path.match(/^\/api\/v1\/noncustodial\/offers\/([^/]+)\/proof$/);
+  if (req.method === 'POST' && proofMatch) {
+    const id = proofMatch[1];
+    const body = await readBody(req);
+    const fundingTxid = String(body.funding_txid || '').trim();
+    const vout = Number(body.vout);
+    const amountSats = Number(body.amount_sats || 0);
+    const verificationMode = body.verification_mode || 'dev_auto';
+    if (!validTxid(fundingTxid)) return json(res, 400, { success: false, error: 'funding_txid must be 64 hex characters' });
+    if (!Number.isInteger(vout) || vout < 0) return json(res, 400, { success: false, error: 'vout must be a non-negative integer' });
+    const result = await db(async c => {
+      await c.query('BEGIN');
+      const offerRes = await c.query(`SELECT * FROM noncustodial_collateral_offers WHERE id=$1 FOR UPDATE`, [id]);
+      if (!offerRes.rowCount) throw new Error('offer not found');
+      const offer = offerRes.rows[0];
+      if (!['OFFERED','LOCK_PROOF_SUBMITTED','LOCK_VERIFIED'].includes(offer.status)) throw new Error(`offer status ${offer.status} cannot accept proof`);
+      if (amountSats < Number(offer.collateral_sats)) throw new Error(`proof amount ${amountSats} below required collateral ${offer.collateral_sats}`);
+      const proof = { funding_txid: fundingTxid, vout, amount_sats: amountSats, proof_type: body.proof_type || 'txid_vout', verification_mode: verificationMode, submitted_at: new Date().toISOString(), notes: body.notes || null };
+      const verified = verificationMode === 'dev_auto' || offer.bitcoin_network === 'bitcoin_regtest' || offer.bitcoin_network === 'bitcoin_testnet' || offer.bitcoin_network === 'mutinynet';
+      await c.query(`
+        UPDATE noncustodial_collateral_offers
+        SET status=$2, lock_txid=$3, lock_vout=$4, lock_amount_sats=$5, lock_proof=$6,
+            lock_verified_at=CASE WHEN $7 THEN NOW() ELSE lock_verified_at END,
+            verification_notes=$8, updated_at=NOW()
+        WHERE id=$1
+      `, [id, verified ? 'LOCK_VERIFIED' : 'LOCK_PROOF_SUBMITTED', fundingTxid, vout, amountSats, proof, verified, verified ? 'Verified by v0 dev/test verifier. Production requires SPV/DLC verification.' : 'Proof submitted; awaiting production verifier/admin review.']);
+      let loan = null;
+      let usdc = null;
+      if (verified && !offer.loan_id) {
+        const loanRes = await c.query(`
+          INSERT INTO loans (
+            borrower_id, collateral_sats, collateral_payment_hash, collateral_confirmed_at,
+            principal_usd, protocol_fee_usd, ltv_at_origination, annual_interest_rate, btc_price_at_origination,
+            status, expires_at, loan_opened_at, created_at, updated_at
+          ) VALUES ($1,$2,$3,NOW(),$4,$5,0.50,0.18,$6,'ACTIVE',NOW() + INTERVAL '90 days',NOW(),NOW(),NOW())
+          RETURNING *
+        `, [offer.borrower_id, offer.collateral_sats, fundingTxid, offer.principal_usd, offer.protocol_fee_usd, offer.btc_price_usd]);
+        loan = loanRes.rows[0];
+        const usdcRes = await c.query(`
+          INSERT INTO usdc_disbursements (loan_id, borrower_id, amount_usdc, network, status, notes, rail)
+          VALUES ($1,$2,$3,'UNSET','PENDING','Awaiting USDC recipient before automated disbursement.','evm_erc20')
+          ON CONFLICT (loan_id) DO UPDATE SET amount_usdc=EXCLUDED.amount_usdc, updated_at=NOW()
+          RETURNING *
+        `, [loan.id, offer.borrower_id, offer.principal_usd]);
+        usdc = usdcRes.rows[0];
+        await c.query(`UPDATE noncustodial_collateral_offers SET status='LOAN_OPENED', loan_id=$2, updated_at=NOW() WHERE id=$1`, [id, loan.id]);
+      }
+      const finalOffer = await c.query(`SELECT * FROM noncustodial_collateral_offers WHERE id=$1`, [id]);
+      await c.query('COMMIT');
+      return { offer: finalOffer.rows[0], loan, usdc };
+    }).catch(async err => {
+      throw err;
+    });
+    return json(res, 200, { success: true, data: result, message: result.loan ? 'Collateral proof accepted and loan opened without Loop custody of borrower BTC.' : 'Collateral proof submitted.' });
+  }
 
   if (req.method === 'GET' && path === '/api/v1/dashboard/summary') {
     const btc = await currentBTCPrice();

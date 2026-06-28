@@ -40,6 +40,15 @@ pnpm install
 pnpm dev
 ```
 
+## Product Surfaces
+
+- `/` — Loop XXI branded product home
+- `/borrow` — human borrower flow for non-custodial collateral offers
+- `/agent` — agent JSON API guide
+- `/app` — admin portfolio dashboard
+- `/app/offers` — non-custodial offer/proof queue
+- `/app/usdc` — USDC disbursement rail and attempt log
+
 ## Repo Structure
 
 ```

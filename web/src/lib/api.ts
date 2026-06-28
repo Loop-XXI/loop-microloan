@@ -93,3 +93,43 @@ export async function confirmUSDCDisbursement(disbursementId: string, body: { tr
   });
   return res.json();
 }
+
+export async function createNoncustodialOffer(body: {
+  borrower_identifier: string;
+  identifier_type: "human" | "agent_id" | "lightning_pubkey";
+  collateral_sats: number;
+  bitcoin_network?: string;
+}) {
+  const res = await fetch(`${API_BASE}/noncustodial/offers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}
+
+export async function getNoncustodialOffers() {
+  const res = await fetch(`${API_BASE}/noncustodial/offers`);
+  return res.json();
+}
+
+export async function getNoncustodialOffer(offerId: string) {
+  const res = await fetch(`${API_BASE}/noncustodial/offers/${offerId}`);
+  return res.json();
+}
+
+export async function submitCollateralProof(offerId: string, body: {
+  funding_txid: string;
+  vout: number;
+  amount_sats: number;
+  proof_type?: string;
+  verification_mode?: string;
+  notes?: string;
+}) {
+  const res = await fetch(`${API_BASE}/noncustodial/offers/${offerId}/proof`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}

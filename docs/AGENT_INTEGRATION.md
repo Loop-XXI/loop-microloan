@@ -1,123 +1,163 @@
 # Loop Microloan — Agent Integration
 
-Any autonomous agent can take a micro-loan against sats. No account required. No KYC.
+Loop Microloan exposes a deterministic JSON interface for autonomous agents that need short-duration USDC liquidity against Bitcoin collateral.
+
+## Non-custodial rule
+
+Agents must not send BTC collateral to a Loop-controlled Lightning invoice as the production collateral model. Collateral is locked in a user/agent-controlled Bitcoin contract. Loop verifies the lock and pays USDC from treasury liquidity.
+
+The old Phoenixd collateral flow is test infrastructure only.
 
 ## Flow
 
-1. POST /api/v1/loans with your identifier and collateral amount
-2. Pay the Lightning invoice returned in the response
-3. USDC credit is recorded on your account (v1: off-chain ledger)
-4. Poll GET /api/v1/loans/:id/status to monitor LTV
-5. POST /api/v1/loans/:id/repay when ready → pay Lightning invoice → loan closed
-6. If LTV hits 80%, liquidation is automatic — no action required
+1. Agent requests a non-custodial collateral offer.
+2. Agent wallet funds the returned Bitcoin contract terms.
+3. Agent submits funding proof.
+4. Protocol verifier accepts the proof and opens the loan.
+5. Loop USDC rail disburses funds to the configured recipient.
+6. Agent polls status and repays when ready.
+7. Contract releases collateral according to repayment/default conditions.
 
-## Minimal agent code (TypeScript)
+## Minimal TypeScript client
 
 ```typescript
-async function openLoan(agentId: string, collateralSats: number) {
-  const res = await fetch('https://api.loop.finance/api/v1/loans', {
+const API = 'https://api.loop.finance/api/v1'
+
+export async function requestOffer(agentId: string, collateralSats: number) {
+  const res = await fetch(`${API}/noncustodial/offers`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       borrower_identifier: agentId,
+      identifier_type: 'agent_id',
       collateral_sats: collateralSats,
-      identifier_type: 'agent_id'
+      bitcoin_network: 'bitcoin_mainnet'
     })
   })
-  const { data } = await res.json()
-  // data.collateral_invoice = BOLT11 to pay
-  // Pay invoice via your Lightning wallet, then poll status
-  return data
+  return res.json()
+}
+
+export async function submitProof(offerId: string, proof: {
+  funding_txid: string
+  vout: number
+  amount_sats: number
+}) {
+  const res = await fetch(`${API}/noncustodial/offers/${offerId}/proof`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...proof, proof_type: 'txid_vout' })
+  })
+  return res.json()
+}
+
+export async function getLoanStatus(loanId: string) {
+  const res = await fetch(`${API}/loans/${loanId}/status`)
+  return res.json()
 }
 ```
 
 ## API Reference
 
-### POST /api/v1/loans
+### POST `/api/v1/noncustodial/offers`
 
-Open a new loan. Returns a Lightning invoice for collateral.
+Creates a non-custodial collateral contract offer.
 
-**Request:**
+Request:
+
 ```json
 {
-  "borrower_identifier": "03abc...pubkey",
-  "collateral_sats": 100000,
-  "identifier_type": "lightning_pubkey" | "agent_id"
+  "borrower_identifier": "agent:demo-001",
+  "identifier_type": "agent_id",
+  "collateral_sats": 50000,
+  "bitcoin_network": "bitcoin_mainnet"
 }
 ```
 
-**Response (202 Accepted):**
-```json
-{
-  "success": true,
-  "data": {
-    "loan_id": "uuid",
-    "status": "PENDING_COLLATERAL",
-    "collateral_invoice": "lnbc...",
-    "payment_hash": "abc123",
-    "collateral_sats_required": 100000,
-    "invoice_expires_at": "2026-06-27T12:00:00Z",
-    "estimated_loan_usd": "28.50",
-    "protocol_fee_usd": "0.14",
-    "ltv_at_origination": 0.50,
-    "btc_price_used": "57000.00",
-    "message": "Pay the Lightning invoice to activate your loan. Invoice expires in 1 hour."
-  }
-}
-```
+Response:
 
-### GET /api/v1/loans/:id/status
-
-Poll loan status. Must be checked before repayment.
-
-**Response when ACTIVE:**
 ```json
 {
   "success": true,
   "data": {
-    "loan_id": "uuid",
-    "status": "ACTIVE",
-    "collateral_sats": 100000,
-    "principal_usd": "28.50",
-    "current_btc_price": "56200.00",
-    "current_ltv": 0.5107,
-    "accrued_interest_sats": 42,
-    "total_repayment_sats": 100042,
-    "hours_active": 1.2,
-    "loan_opened_at": "2026-06-27T10:00:00Z",
-    "expires_at": "2026-09-25T10:00:00Z",
-    "margin_call_ltv": 0.70,
-    "liquidation_ltv": 0.80
+    "id": "offer-uuid",
+    "status": "OFFERED",
+    "collateral_sats": "50000",
+    "principal_usd": "15.0000",
+    "protocol_fee_usd": "0.0750",
+    "contract_type": "taproot_escrow_v0",
+    "bitcoin_network": "bitcoin_mainnet",
+    "contract_terms": {
+      "custody": "non_custodial",
+      "descriptor_hash": "0x...",
+      "proof_required": {
+        "funding_txid": "64-character transaction id funding the borrower-controlled contract output",
+        "vout": "output index of the contract UTXO",
+        "amount_sats": 50000
+      },
+      "warning": "v0 test interface. Production requires SPV/DLC verification before USDC release."
+    }
   }
 }
 ```
 
-### POST /api/v1/loans/:id/repay
+### POST `/api/v1/noncustodial/offers/:id/proof`
 
-Initiate repayment. Returns a Lightning invoice for total repayment (principal + accrued interest).
+Submits contract funding proof.
 
-**Response:**
+Request:
+
+```json
+{
+  "funding_txid": "0000000000000000000000000000000000000000000000000000000000000001",
+  "vout": 0,
+  "amount_sats": 50000,
+  "proof_type": "txid_vout"
+}
+```
+
+Response when verifier opens a loan:
+
 ```json
 {
   "success": true,
+  "message": "Collateral proof accepted and loan opened without Loop custody of borrower BTC.",
   "data": {
-    "repayment_invoice": "lnbc...",
-    "repayment_sats": 100145,
-    "breakdown": {
-      "principal_sats": 100000,
-      "interest_sats": 145,
-      "hours_active": 7.05
-    },
-    "invoice_expires_at": "2026-06-27T20:00:00Z"
+    "offer": { "status": "LOAN_OPENED" },
+    "loan": { "id": "loan-uuid", "status": "ACTIVE" },
+    "usdc": { "status": "PENDING" }
   }
 }
 ```
+
+### POST `/api/v1/loans/:id/usdc/recipient`
+
+Sets the USDC recipient.
+
+```json
+{
+  "network": "base",
+  "recipient_address": "0x..."
+}
+```
+
+### GET `/api/v1/loans/:id/status`
+
+Polls loan state, LTV, accrued interest, repayment amount, and USDC disbursement state.
+
+### POST `/api/v1/loans/:id/repay`
+
+Creates a Lightning repayment invoice for principal + accrued interest.
 
 ## Constraints
 
-- Max 10 active loans per `borrower_identifier`
-- Max 5 loan requests per identifier per 24h
 - Minimum collateral: 50,000 sats
 - Maximum collateral: 2,000,000 sats
-- Loan duration: 1 hour minimum, 90 days maximum
-- Liquidation is automatic at 80% LTV; no action required from borrower
+- LTV at origination: 50%
+- Margin call: 70%
+- Liquidation threshold: 80%
+- APR: 18%
+- Protocol fee: 0.5% of principal
+
+## Production verifier requirement
+
+The v0 bridge can auto-verify testnet/regtest/mutinynet proof for development. Mainnet production must replace this with SPV, DLC, or equivalent contract verification before USDC is released.
